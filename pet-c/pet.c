@@ -1510,7 +1510,7 @@ static void parse_kv(const char *body, pet_txt *out)
  * 走 GET 而不是 POST，是为了复用现成的 http_get，不用再写一个 HTTP 客户端 */
 static void dismiss_session(const char *id)
 {
-    if (!id || !id[0]) return;
+    if (!id) return;
     char enc[160], path[200], buf[32];
     size_t j = 0;
     for (const char *p = id; *p && j + 4 < sizeof(enc); p++) {

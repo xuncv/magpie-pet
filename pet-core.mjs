@@ -19,7 +19,6 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 
 const DONE_HOLD_MS = 4000;      // 完成后整体动画停留
 const ROW_HOLD_MS = 10000;      // 完成/失败后“宠物姿态”还跟多久（列表里不再自动消失）
@@ -158,7 +157,7 @@ export function createPetCore(options = {}) {
     for (const r of s.rows ?? []) {
       const el = isRunning(r) ? Date.now() - r.startedAt : r.elapsed || 0;
       lines.push(
-        `s=${clean(r.id, 40)}|${clean(r.agent, 20)}|${clean(r.model, 32)}|${r.state}|${r.round}|${el}` +
+        `s=${clean(r.id, 47)}|${clean(r.agent, 20)}|${clean(r.model, 32)}|${r.state}|${r.round}|${el}` +
           `|${r.tin}|${r.tout}|${r.credits.toFixed(2)}|${clean(r.query, 90)}`
       );
     }
@@ -184,8 +183,12 @@ export function createPetCore(options = {}) {
   }
 
   // ---------------- 事件入口 ----------------
+  // 没有 session 的事件统一归到固定哨兵：start/end 能配对，桌宠拿到的 id 也非空，
+  // 能像普通会话一样点 × 关掉（空 id 在 C 侧会被当成无效参数直接丢掉）。
+  const sidOf = (ev) => ev?.session || "_";
+
   function onStart(ev) {
-    const id = ev.session || randomUUID();
+    const id = sidOf(ev);
     const s = getSess(id, true);
     s.agent = ev.agent || s.agent;
     s.model = ev.model || s.model;
@@ -199,8 +202,16 @@ export function createPetCore(options = {}) {
   }
 
   function onEnd(ev) {
-    const id = ev.session || "";
-    const s = getSess(id, true);
+    const id = sidOf(ev);
+    let s = sessions.get(id);
+    if (!s) {
+      /* 没收到 start 的 end：带身份信息才补一行，纯匿名事件不造幽灵行 */
+      if (!ev.agent && !ev.model && !ev.query) return;
+      s = getSess(id, true);
+    }
+    if (!s.agent && ev.agent) s.agent = ev.agent;
+    if (!s.model && ev.model) s.model = ev.model;
+    if (!s.query && ev.query) s.query = ev.query;
     const elapsed = ev.elapsedMs ?? Date.now() - s.startedAt;
     const u = ev.usage ?? {};
     const out = u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? 0;
@@ -229,8 +240,15 @@ export function createPetCore(options = {}) {
   }
 
   function onError(ev) {
-    const id = ev.session || "";
-    const s = getSess(id, true);
+    const id = sidOf(ev);
+    let s = sessions.get(id);
+    if (!s) {
+      if (!ev.agent && !ev.model && !ev.query) return;
+      s = getSess(id, true);
+    }
+    if (!s.agent && ev.agent) s.agent = ev.agent;
+    if (!s.model && ev.model) s.model = ev.model;
+    if (!s.query && ev.query) s.query = ev.query;
     s.state = "failed";
     s.err = `${describeError(Number(ev.code) || 0, ev.err)}${ev.code ? " " + ev.code : ""}`;
     s.finishedAt = Date.now();
@@ -238,7 +256,7 @@ export function createPetCore(options = {}) {
   }
 
   function onCancel(ev) {
-    const id = ev.session || "";
+    const id = sidOf(ev);
     sessions.delete(id);
     emitState({ bubble: "已取消" });
   }

@@ -75,7 +75,7 @@ function baseEvent(kind, ctx) {
   return {
     kind,
     ts: Date.now(),
-    session: ctx?.session ?? "",
+    session: (ctx?.session ?? "") || "_",
     agent: ctx?.agent ?? "",
     protocol: ctx?.protocol ?? "",
     model: ctx?.model ?? "",
