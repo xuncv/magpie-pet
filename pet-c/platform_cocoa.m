@@ -248,7 +248,7 @@ void plat_move(plat_window *w, int x, int y)
     if (!w) return;
     @autoreleasepool {
         NSScreen *scr = [NSScreen mainScreen];
-        CGFloat sh = scr ? scr->frame.size.height : 1080;
+        CGFloat sh = scr ? scr.frame.size.height : 1080;
         /* 传入的是「屏幕坐标（左上原点）」，转成 Cocoa（左下原点） */
         NSRect f = [w->win frame];
         f.origin.x = x;
@@ -263,7 +263,7 @@ void plat_get_pos(plat_window *w, int *x, int *y)
     @autoreleasepool {
         NSRect f = [w->win frame];
         NSScreen *scr = [NSScreen mainScreen];
-        CGFloat sh = scr ? scr->frame.size.height : 1080;
+        CGFloat sh = scr ? scr.frame.size.height : 1080;
         *x = (int)f.origin.x;
         *y = (int)(sh - f.origin.y - f.size.height);
     }
@@ -274,7 +274,7 @@ void plat_cursor(int *x, int *y)
     @autoreleasepool {
         NSPoint p = [NSEvent mouseLocation];   /* 左下原点 */
         NSScreen *scr = [NSScreen mainScreen];
-        CGFloat sh = scr ? scr->frame.size.height : 1080;
+        CGFloat sh = scr ? scr.frame.size.height : 1080;
         *x = (int)p.x;
         *y = (int)(sh - p.y);
     }
@@ -334,7 +334,7 @@ void plat_resize(plat_window *w, int width, int height)
     @autoreleasepool {
         NSRect f = [w->win frame];
         NSScreen *scr = [NSScreen mainScreen];
-        CGFloat sh = scr ? scr->frame.size.height : 1080;
+        CGFloat sh = scr ? scr.frame.size.height : 1080;
         /* 保持左下角不动，向上/右生长 */
         f.size.width = width;
         f.size.height = height;

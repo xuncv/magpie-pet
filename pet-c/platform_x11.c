@@ -23,6 +23,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
+#include <errno.h>
 
 #include "platform.h"
 
