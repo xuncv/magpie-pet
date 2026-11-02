@@ -1,0 +1,26 @@
+# 构建产物（源码在，能重编）
+pet-c/pet.exe
+pet-c/pet
+*.o
+*.obj
+
+# 运行时状态 / 日志（每次跑都会变）
+pet-pos.txt
+pet.lock
+pet-log.txt
+pet-trace.txt
+pet-crash.txt
+
+# 素材源视频 / 生成物（体积大）
+sources/
+*.mp4
+pets/*-hd/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

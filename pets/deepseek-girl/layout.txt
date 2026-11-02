@@ -1,0 +1,8 @@
+cell=128x179
+cols=49
+rows=4
+track=idle row=0 frames=49 total=4040
+track=review row=1 frames=41 total=4040
+track=running row=2 frames=46 total=4040
+track=jumping row=3 frames=49 total=4040
+track=waiting row=0 frames=49 total=4040

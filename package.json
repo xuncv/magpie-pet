@@ -1,0 +1,19 @@
+{
+  "name": "magpie-pet-hooks",
+  "version": "0.1.0",
+  "description": "magpie gateway request hooks -> desktop pet events",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuncv/magpie-pet.git"
+  },
+  "type": "module",
+  "private": true,
+  "magpie": {
+    "hooks": "./pet.hooks.js",
+    "options": {
+      "serverUrl": "http://127.0.0.1:8789/event",
+      "gatewayTimeoutMs": 800
+    }
+  }
+}

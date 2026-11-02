@@ -1,0 +1,14 @@
+# 统一换行：仓库里存 LF，Windows 脚本检出成 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制素材
+*.png  binary
+*.gif  binary
+*.webp binary
+*.mp4  binary
+
+# 第三方代码不计入语言统计
+pet-c/third_party/** linguist-vendored
