@@ -9,7 +9,7 @@
 # macOS 需要 Xcode 命令行工具
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 LDFLAGS ?=
 
 TARGET  = pet

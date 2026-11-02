@@ -1,6 +1,7 @@
 # magpie 桌面宠物
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![build](https://github.com/xuncv/magpie-pet/actions/workflows/build.yml/badge.svg)](https://github.com/xuncv/magpie-pet/actions/workflows/build.yml)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![C11](https://img.shields.io/badge/C-11-informational)
 

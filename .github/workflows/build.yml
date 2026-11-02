@@ -1,0 +1,89 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (X11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install X11 headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libx11-dev libxext-dev
+
+      - name: Build
+        run: make -C pet-c linux
+
+      - name: Verify
+        run: |
+          file pet-c/pet
+          ldd pet-c/pet | grep -E 'libX11|libXext'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pet-linux
+          path: pet-c/pet
+          if-no-files-found: error
+
+  macos:
+    name: macOS (Cocoa)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make -C pet-c macos
+
+      - name: Verify
+        run: |
+          file pet-c/pet
+          otool -L pet-c/pet | grep -E 'Cocoa|CoreText'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pet-macos
+          path: pet-c/pet
+          if-no-files-found: error
+
+  windows:
+    name: Windows (MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc make
+
+      - name: Build
+        shell: msys2 {0}
+        run: make -C pet-c windows
+
+      - name: Verify
+        shell: msys2 {0}
+        run: |
+          test -f pet-c/pet.exe
+          ls -l pet-c/pet.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pet-windows
+          path: pet-c/pet.exe
+          if-no-files-found: error
