@@ -19,7 +19,7 @@ jobs:
     name: Linux (X11)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install X11 headers
         run: |
@@ -34,7 +34,7 @@ jobs:
           file pet-c/pet
           ldd pet-c/pet | grep -E 'libX11|libXext'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pet-linux
           path: pet-c/pet
@@ -44,7 +44,7 @@ jobs:
     name: macOS (Cocoa)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build
         run: make -C pet-c macos
@@ -54,7 +54,7 @@ jobs:
           file pet-c/pet
           otool -L pet-c/pet | grep -E 'Cocoa|CoreText'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pet-macos
           path: pet-c/pet
@@ -64,13 +64,13 @@ jobs:
     name: Windows (MinGW-w64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          install: mingw-w64-x86_64-gcc make
+          install: mingw-w64-ucrt-x86_64-gcc make
 
       - name: Build
         shell: msys2 {0}
@@ -82,7 +82,7 @@ jobs:
           test -f pet-c/pet.exe
           ls -l pet-c/pet.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pet-windows
           path: pet-c/pet.exe
