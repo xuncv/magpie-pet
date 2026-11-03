@@ -29,6 +29,8 @@ static int PET_W = 181, PET_H = 196;
 #define LOOK_MIN_IDLE_MS   1200      /* 刚启动/刚有事件后先正常播 idle，过一会儿才允许注视帧 */
 #define LOOK_RADIUS        700.0     /* 光标离多近才看过去（之前 1400 几乎覆盖全屏，导致永远在看） */
 #define PET_REACT_MS 1500     /* 被摸到时插播完成态的时长 */
+#define BUB_FADE_IN_MS   140  /* 气泡淡入 */
+#define BUB_FADE_OUT_MS  280  /* 气泡淡出（最后这段时间里向上飘） */
 #define POLL_MS 250
 
 /* ---------------- 轨道（运行时） ----------------
@@ -166,7 +168,26 @@ static uint64_t g_last_event_at = 0;
 static int g_cur_frame = -1;
 static int g_seq = -1;
 static int g_active = 0;
-static char g_bubble[512];
+
+/* 气泡：两个槽 + 当前要画的那个（生命周期见「气泡」那节）
+ *   0 = 远端（服务端事件），1 = 本地（菜单操作 / 连接状态） */
+enum { BUB_LIVE = 0, BUB_INFO, BUB_OK, BUB_ERR };
+typedef struct {
+    char text[512];
+    char agent[64];      /* 画状态行用；空就不画状态行（本地提示） */
+    char state[32];
+    uint64_t at;         /* 出现的时刻（plat_ms），淡入淡出按它算 */
+    uint32_t ttl;        /* 还能活多久；0 = 不过期（live） */
+    int kind;
+    int dying;           /* 服务端已收走：只剩一段淡出，别直接抹掉 */
+} bubble_t;
+static bubble_t g_bub[2];
+static const bubble_t *g_bub_cur = NULL;   /* 本帧画哪个，NULL = 不画 */
+static double g_bub_alpha = 0.0;
+static int g_bub_shift = 0;               /* 淡出时向上飘几像素 */
+static int g_bub_was_visible = 0;
+static uint64_t g_bub_shown_at = 0;
+
 static char g_agent[64];
 static char g_model[128];
 static int g_round_no = 0;
@@ -340,10 +361,13 @@ static int look_rect(double angle_deg, int *sx, int *sy)
 
 /* ---------------- 软件合成 ---------------- */
 static uint32_t *g_fb;
+/* 气泡淡出用：在 blend 里再乘一次 alpha（0..255），只包围气泡那几行绘制 */
+static uint32_t g_blend_mul = 255;
 
 static inline uint32_t blend(uint32_t dst, uint32_t src)
 {
     uint32_t sa = (src >> 24) & 0xFF;
+    if (g_blend_mul != 255) sa = sa * g_blend_mul / 255;
     if (sa == 0) return dst;
     if (sa == 255) return src;
     uint32_t da = (dst >> 24) & 0xFF;
@@ -1009,6 +1033,121 @@ static void copy_utf8(char *dst, size_t cap, const char *src, size_t len)
     dst[c] = 0;
 }
 
+/* ---------------- 气泡生命周期 ----------------
+ * 气泡是「通知」，不是「状态」：每条消息都有寿命，到点自己淡出。
+ * 这样不管服务端发不发空字符串，头顶都不会永远挂着一个框。
+ *
+ *   live  进行中（不过期，被下一条替换）   ok  完成 3.5s
+ *   info  菜单/系统提示 2.6s              err 失败 9s，期间不被别的消息挤掉
+ *
+ * 同一段文字反复轮询到不会续命：只有文字变了才重置 at。
+ */
+static const int BUB_RANK[4] = { 0, 2, 2, 3 };   /* live < info == ok < err */
+
+static int bubble_kind_of(const char *s)
+{
+    if (strcmp(s, "err") == 0) return BUB_ERR;
+    if (strcmp(s, "ok") == 0) return BUB_OK;
+    if (strcmp(s, "live") == 0) return BUB_LIVE;
+    return BUB_INFO;
+}
+
+static int bub_alive(const bubble_t *b, uint64_t now)
+{
+    if (!b->text[0]) return 0;
+    return !b->ttl || now < b->at + b->ttl;
+}
+
+static void bub_set(bubble_t *b, const char *text, int kind, uint32_t left,
+                    const char *agent, const char *state, uint64_t now)
+{
+    if (!text || !text[0]) {
+        /* 服务端说“没了”：不要瞬间消失，补一段淡出再收掉 */
+        if (b->text[0] && !b->dying) {
+            b->dying = 1;
+            b->at = now;
+            b->ttl = BUB_FADE_OUT_MS;
+        } else if (!b->text[0]) {
+            memset(b, 0, sizeof(*b));
+        }
+        return;
+    }
+
+    if (b->text[0] && strcmp(b->text, text) == 0) {
+        /* 还是同一条消息：只跟着服务端补元信息，不重置 at、不重新淡入，
+         * 否则轮询每 250ms 都会把它续命到永远 */
+        if (b->dying) return;
+        b->kind = kind;
+        if (agent && agent[0]) copy_utf8(b->agent, sizeof(b->agent), agent, strlen(agent));
+        if (state && state[0]) copy_utf8(b->state, sizeof(b->state), state, strlen(state));
+        return;
+    }
+    /* 低优先级不顶掉还没过期的高优先级：「已置顶」不该盖住错误原因 */
+    if (b->text[0] && bub_alive(b, now) && BUB_RANK[b->kind] > BUB_RANK[kind]) return;
+
+    memset(b, 0, sizeof(*b));
+    copy_utf8(b->text, sizeof(b->text), text, strlen(text));
+    if (agent) copy_utf8(b->agent, sizeof(b->agent), agent, strlen(agent));
+    if (state) copy_utf8(b->state, sizeof(b->state), state, strlen(state));
+    b->kind = kind;
+    b->at = now;
+    b->ttl = left;
+}
+
+/* 本地的短暂提示（菜单操作、连接状态） */
+static void bub_local(const char *text, int kind, uint32_t ttl)
+{
+    bub_set(&g_bub[1], text, kind, ttl, "", "", plat_ms());
+}
+
+static const bubble_t *bub_pick(uint64_t now)
+{
+    int ra = bub_alive(&g_bub[0], now), rb = bub_alive(&g_bub[1], now);
+    if (ra && rb) {
+        if (BUB_RANK[g_bub[1].kind] != BUB_RANK[g_bub[0].kind])
+            return BUB_RANK[g_bub[1].kind] > BUB_RANK[g_bub[0].kind] ? &g_bub[1] : &g_bub[0];
+        return g_bub[1].at >= g_bub[0].at ? &g_bub[1] : &g_bub[0];
+    }
+    if (rb) return &g_bub[1];
+    if (ra) return &g_bub[0];
+    return NULL;
+}
+
+/* 每帧算一次：画哪条 + 透明度 + 上飘位移 */
+static void bub_tick(uint64_t now)
+{
+    const bubble_t *b = bub_pick(now);
+
+    if (b && !g_bub_was_visible) { g_bub_shown_at = now; g_bub_was_visible = 1; }
+    if (!b) {
+        g_bub_was_visible = 0;
+        g_bub_cur = NULL;
+        g_bub_alpha = 0.0;
+        g_bub_shift = 0;
+        return;
+    }
+
+    double a = 1.0;
+    int shift = 0;
+    uint64_t age = now - g_bub_shown_at;
+    if (age < BUB_FADE_IN_MS) {
+        a = (double)age / BUB_FADE_IN_MS;
+        shift = (int)((1.0 - a) * 4.0 + 0.5);          /* 从下往上浮进来 */
+    }
+    if (b->ttl) {
+        uint64_t end = b->at + b->ttl;
+        if (now >= end) a = 0.0;
+        else if (end - now < BUB_FADE_OUT_MS) {
+            double o = (double)(end - now) / BUB_FADE_OUT_MS;
+            if (o < a) { a = o; shift = -(int)((1.0 - o) * 6.0 + 0.5); }   /* 向上飘走 */
+        }
+    }
+    if (a < 0.004) a = 0.0;
+    g_bub_cur = b;
+    g_bub_alpha = a;
+    g_bub_shift = shift;
+}
+
 
 static void draw_list(void)
 {
@@ -1230,7 +1369,7 @@ static void apply_scale(plat_window *win, double s)
 
     char msg[64];
     snprintf(msg, sizeof(msg), "大小已调到 %d%%", (int)(s * 100 + 0.5));
-    copy_utf8(g_bubble, sizeof(g_bubble), msg, strlen(msg));
+    bub_local(msg, BUB_INFO, 2200);
     plog("scale -> %.2f pet=%dx%d win=%dx%d", s, PET_W, PET_H, WIN_W, WIN_H);
 }
 
@@ -1280,9 +1419,10 @@ no_look:
     *osy = sy;
 }
 
+/* 当前显示哪个会话：固定优先，否则第一行 */
 /* 静态层：气泡 + 列表 + 菜单（不含精灵）。
  * 这一层只在内容变化时重画，每帧真正画的是「拷贝 + 精灵」。 */
-static void render_static(const char *bubble)
+static void render_static(void)
 {
     int pet_x = pet_local_x();
     int pet_y = WIN_H - PET_MARGIN_BOTTOM - PET_H;
@@ -1291,46 +1431,43 @@ static void render_static(const char *bubble)
     g_over_r = g_over_b = 0;
 
     /* 2. 气泡：两行（状态行 + 内容行），与列表同一套配色。
-     *    列表展开时不画：头顶再挂个框会互相遮挡，且列表里已经有全部信息 */
+     *    列表展开时不画：头顶再挂个框会互相遮挡，且列表里已经有全部信息。
+     *    内容行只来自「有寿命的气泡」，没有就整块不画 —— 这是气泡能消失的关键。 */
     if (!g_list_open) {
-        /* 决定显示哪个会话：固定优先，否则第一行 */
-        const sess_t *cs = NULL;
-        if (g_pinned[0]) {
-            for (int i = 0; i < g_nsess; i++)
-                if (strcmp(g_sess[i].id, g_pinned) == 0) { cs = &g_sess[i]; break; }
-        }
-        if (!cs && g_nsess > 0) cs = &g_sess[0];
+        const bubble_t *bub = g_bub_cur;
+        int is_local = (bub == &g_bub[1]);       /* 菜单/连接提示：没有身份，不画状态行 */
 
         char l2[256];
         l2[0] = 0;
-        if (cs) {
-            if (cs->query[0])
-                copy_utf8(l2, sizeof(l2), cs->query, strlen(cs->query));
-            else if (bubble && bubble[0])
-                copy_utf8(l2, sizeof(l2), bubble, strlen(bubble));
-        } else if (bubble && bubble[0]) {
-            copy_utf8(l2, sizeof(l2), bubble, strlen(bubble));
-        }
+        if (bub && bub->text[0]) copy_utf8(l2, sizeof(l2), bub->text, strlen(bub->text));
 
-        if (cs || l2[0]) {
+        if (l2[0]) {
             const int pad = 10;
             const int maxw = PET_W + 72;    /* 跟宠物走，不能按窗口宽（展开列表后会溢出） */
 
-            /* 第一行：agent + 状态 */
+            /* 第一行：agent + 状态。身份跟着气泡走（同一条气泡可能来自第二行会话），
+             * 没带身份的（系统提示）就只画内容行 */
+            const char *who = "";
+            const char *st = "";
+            if (bub && !is_local && bub->agent[0]) {
+                who = bub->agent;
+                st = bub->state;
+            }
+
             char l1[64];
             l1[0] = 0;
             int l1w = 0, l1h = 0;
-            uint32_t l1col = cs ? state_color(cs->state) : 0;
-            if (cs) {
-                copy_utf8(l1, sizeof(l1), cs->agent[0] ? cs->agent : "?", strlen(cs->agent[0] ? cs->agent : "?"));
+            uint32_t l1col = st[0] ? state_color(st) : 0;
+            if (who[0]) {
+                copy_utf8(l1, sizeof(l1), who, strlen(who));
                 get_text(l1, 15, C_INK, maxw - 60, &l1w, &l1h);
             }
 
             /* 第二行 */
             int l2w = 0, l2h = 0;
-            uint32_t *t2 = l2[0] ? get_text(l2, 14, C_INK2, maxw - pad * 2, &l2w, &l2h) : NULL;
+            uint32_t *t2 = get_text(l2, 14, C_INK2, maxw - pad * 2, &l2w, &l2h);
 
-            int dotw = cs ? 14 : 0;
+            int dotw = l1h > 0 ? 14 : 0;
             int bw = (l1w + dotw > l2w ? l1w + dotw : l2w) + pad * 2 + 8;
             if (bw < 72) bw = 72;
             if (bw > maxw) bw = maxw;
@@ -1339,47 +1476,57 @@ static void render_static(const char *bubble)
             int bx = pet_x + (PET_W - bw) / 2;
             if (bx < 4) bx = 4;
             if (bx + bw > WIN_W - 4) bx = WIN_W - 4 - bw;
-            int by = pet_y - bh - 16;
+            int by = pet_y - bh - 16 + g_bub_shift;   /* 淡出时向上飘 */
             if (by < 6) by = 6;
-            ui_over_add(bx - 8, by - 8, bx + bw + 8, by + bh + 8);   /* 含阴影和尖角 */
 
-            /* 投影 */
-            for (int i = 6; i >= 1; i--)
-                fill_round_rect(bx - i, by - i + 1, bw + i * 2, bh + i * 2, 12 + i,
-                                (uint32_t)(6 + (7 - i) * 2) << 24);
-            /* 边 + 底 */
-            fill_round_rect(bx - 1, by - 1, bw + 2, bh + 2, 13, 0x1E000000u);
-            fill_triangle(bx + bw / 2 - 6, by + bh - 2,
-                          bx + bw / 2 + 6, by + bh - 2,
-                          bx + bw / 2,     by + bh + 6, 0xFCFFFFFFu);
-            fill_round_rect(bx, by, bw, bh, 12, 0xFCFFFFFFu);
+            /* 透明度：淡入淡出期间把整块气泡（含阴影）乘一个 alpha */
+            uint32_t mul = (uint32_t)(g_bub_alpha * 255.0 + 0.5);
+            if (mul > 255) mul = 255;
 
-            int ty = by + pad;
-            if (l1h > 0) {
-                draw_dot(bx + pad + 5, ty + l1h / 2 + 1, l1col, 3, state_running(cs->state));
-                draw_text(l1, 15, C_INK, bx + pad + 14, ty, maxw - 70);
-                draw_text(state_label(cs->state), 13, l1col,
-                          bx + pad + 14 + l1w + 8, ty + 2, 78);
-                ty += l1h + 4;
-            }
-            if (t2) {
-                /* 重新取一次：上面两次 draw_text 可能把缓存槽挤掉（环形替换），
-                 * 直接拖旧的 t2 就是 use-after-free */
-                t2 = get_text(l2, 13, C_INK2, maxw - pad * 2, &l2w, &l2h);
-            }
-            if (t2) {
-                for (int y = 0; y < l2h; y++) {
-                    int fy = ty + y;
-                    if (fy < by + 2 || fy >= by + bh - 2) continue;
-                    for (int x = 0; x < l2w; x++) {
-                        int fx = bx + pad + x;
-                        if (fx < bx + 2 || fx >= bx + bw - 2) continue;
-                        if (fx < 0 || fx >= WIN_W || fy < 0 || fy >= WIN_H) continue;
-                        uint32_t p = t2[(size_t)y * l2w + x];
-                        if (((p >> 24) & 0xFF) == 0) continue;
-                        g_fb[(size_t)fy * WIN_W + fx] = blend(g_fb[(size_t)fy * WIN_W + fx], p);
+            if (mul > 0) {
+                g_blend_mul = mul;
+                ui_over_add(bx - 8, by - 8, bx + bw + 8, by + bh + 8);   /* 含阴影和尖角 */
+
+                /* 投影 */
+                for (int i = 6; i >= 1; i--)
+                    fill_round_rect(bx - i, by - i + 1, bw + i * 2, bh + i * 2, 12 + i,
+                                    (uint32_t)(6 + (7 - i) * 2) << 24);
+                /* 边 + 底 */
+                fill_round_rect(bx - 1, by - 1, bw + 2, bh + 2, 13, 0x1E000000u);
+                fill_triangle(bx + bw / 2 - 6, by + bh - 2,
+                              bx + bw / 2 + 6, by + bh - 2,
+                              bx + bw / 2,     by + bh + 6, 0xFCFFFFFFu);
+                fill_round_rect(bx, by, bw, bh, 12, 0xFCFFFFFFu);
+
+                int ty = by + pad;
+                if (l1h > 0) {
+                    draw_dot(bx + pad + 5, ty + l1h / 2 + 1, l1col, 3, st[0] && state_running(st));
+                    draw_text(l1, 15, C_INK, bx + pad + 14, ty, maxw - 70);
+                    if (st[0])
+                        draw_text(state_label(st), 13, l1col,
+                                  bx + pad + 14 + l1w + 8, ty + 2, 78);
+                    ty += l1h + 4;
+                }
+                if (t2) {
+                    /* 重新取一次：上面两次 draw_text 可能把缓存槽挤掉（环形替换），
+                     * 直接拖旧的 t2 就是 use-after-free */
+                    t2 = get_text(l2, 13, C_INK2, maxw - pad * 2, &l2w, &l2h);
+                }
+                if (t2) {
+                    for (int y = 0; y < l2h; y++) {
+                        int fy = ty + y;
+                        if (fy < by + 2 || fy >= by + bh - 2) continue;
+                        for (int x = 0; x < l2w; x++) {
+                            int fx = bx + pad + x;
+                            if (fx < bx + 2 || fx >= bx + bw - 2) continue;
+                            if (fx < 0 || fx >= WIN_W || fy < 0 || fy >= WIN_H) continue;
+                            uint32_t p = t2[(size_t)y * l2w + x];
+                            if (((p >> 24) & 0xFF) == 0) continue;
+                            g_fb[(size_t)fy * WIN_W + fx] = blend(g_fb[(size_t)fy * WIN_W + fx], p);
+                        }
                     }
                 }
+                g_blend_mul = 255;
             }
         }
     }
@@ -1434,6 +1581,10 @@ typedef struct {
     char model[128];
     int round_no;
     char bubble[512];
+    char bubble_kind[16];
+    int bubble_left;        /* 还剩多久淡出（ms），0 = 不过期 */
+    char bubble_agent[64];
+    char bubble_state[32];
 } pet_txt;
 
 
@@ -1466,6 +1617,14 @@ static void parse_kv(const char *body, pet_txt *out)
                 out->round_no = atoi(v);
             } else if (klen == 6 && strncmp(p, "bubble", 6) == 0) {
                 copy_utf8(out->bubble, sizeof(out->bubble), v, vlen);
+            } else if (klen == 11 && strncmp(p, "bubble_kind", 11) == 0) {
+                copy_utf8(out->bubble_kind, sizeof(out->bubble_kind), v, vlen);
+            } else if (klen == 11 && strncmp(p, "bubble_left", 11) == 0) {
+                out->bubble_left = atoi(v);
+            } else if (klen == 12 && strncmp(p, "bubble_agent", 12) == 0) {
+                copy_utf8(out->bubble_agent, sizeof(out->bubble_agent), v, vlen);
+            } else if (klen == 12 && strncmp(p, "bubble_state", 12) == 0) {
+                copy_utf8(out->bubble_state, sizeof(out->bubble_state), v, vlen);
             } else if (klen == 1 && p[0] == 's' && vlen > 2) {
                 /* s=<id>|<agent>|<model>|<state>|<round>|<elapsed>|<tin>|<tout>|<credits>|<query> */
                 if (g_nsess < (int)(sizeof(g_sess) / sizeof(g_sess[0]))) {
@@ -1562,7 +1721,23 @@ static void apply(const pet_txt *t)
         copy_utf8(g_agent, sizeof(g_agent), t->agent, strlen(t->agent));
         copy_utf8(g_model, sizeof(g_model), t->model, strlen(t->model));
         g_round_no = t->round_no;
-        if (t->bubble[0]) copy_utf8(g_bubble, sizeof(g_bubble), t->bubble, strlen(t->bubble));
+    }
+
+    /* 气泡跟着每次轮询同步：服务端会带寿命（bubble_left），过期就是空。
+     * 旧内核只给 bubble 文本、而且完成/失败后不清空 —— 有人正在跑就按 live
+     * 处理（不过期），否则当普通提示给 3.5s 寿命，不会再永远挂着。 */
+    {
+        int kind = bubble_kind_of(t->bubble_kind);
+        uint32_t left = (uint32_t)t->bubble_left;
+        if (!t->bubble_kind[0]) {
+            int running = 0;
+            for (int i = 0; i < g_nsess; i++)
+                if (state_running(g_sess[i].state)) { running = 1; break; }
+            if (running) kind = BUB_LIVE;
+        }
+        if (left == 0 && kind != BUB_LIVE) left = 3500;   /* 旧内核没给寿命：给个默认 */
+        bub_set(&g_bub[0], t->bubble, kind, left,
+                t->bubble_agent, t->bubble_state, plat_ms());
     }
 
     /* 姿态不问内核要，直接看会话表：
@@ -1629,7 +1804,13 @@ static uint64_t sig_ui_part(void)
     h = hash_add(h, (uint64_t)(WIN_W * 7919u + WIN_H));
     h = hash_add(h, (uint64_t)(PET_W * 7919u + PET_H));
     h = hash_str(h, g_pinned);
-    h = hash_str(h, g_bubble);
+    /* 气泡：内容 + 身份 + 淡入淡出进度。不把 alpha/位移算进去的话，
+     * 淡出期间内容没变就不会重画，气泡会“卡”在半透明状态 */
+    h = hash_str(h, g_bub_cur ? g_bub_cur->text : "");
+    h = hash_str(h, g_bub_cur ? g_bub_cur->agent : "");
+    h = hash_str(h, g_bub_cur ? g_bub_cur->state : "");
+    h = hash_add(h, (uint64_t)(int)(g_bub_alpha * 1000.0 + 0.5));
+    h = hash_add(h, (uint64_t)(g_bub_shift + 64));
     h = hash_str(h, g_agent);
     h = hash_str(h, g_model);
     for (int i = 0; i < g_nsess; i++) {
@@ -1876,14 +2057,18 @@ int main(int argc, char **argv)
         if (now >= next_poll) {
             next_poll = now + POLL_MS;
             if (http_get(host, port, "/pet.txt", body, sizeof(body)) == 0) {
+                if (fail_streak >= 20) {              /* 刚好重连上：把断线提示收掉 */
+                    memset(&g_bub[1], 0, sizeof(g_bub[1]));
+                    bub_local("已重新连接", BUB_OK, 2200);
+                }
                 fail_streak = 0;
                 pet_txt t;
                 parse_kv(body, &t);
                 apply(&t);
             } else {
                 fail_streak++;
-                if (fail_streak == 20 && g_bubble[0] == 0)
-                    snprintf(g_bubble, sizeof(g_bubble), "未连接事件服务");
+                if (fail_streak >= 20 && !bub_alive(&g_bub[1], now))
+                    bub_local("未连接事件服务", BUB_ERR, 60000);   /* 断线期间每分钟重新提醒一次 */
             }
         }
 
@@ -1935,13 +2120,15 @@ int main(int argc, char **argv)
                 if (g_click_through_all) {
                     g_click_through_until = plat_ms() + 30000;   /* 30s 自动恢复，避免彻底失控 */
                     const char *hk = plat_hotkey_name(win);
+                    char msg[160];
                     if (hk && hk[0])
-                        snprintf(g_bubble, sizeof(g_bubble), "点击穿透 30 秒后自动恢复\n%s 可立刻关闭", hk);
+                        snprintf(msg, sizeof(msg), "点击穿透 30 秒后自动恢复 · %s 可立刻关闭", hk);
                     else
-                        snprintf(g_bubble, sizeof(g_bubble), "点击穿透 30 秒后自动恢复");
+                        snprintf(msg, sizeof(msg), "点击穿透 30 秒后自动恢复");
+                    bub_local(msg, BUB_INFO, 3200);
                 } else {
                     g_click_through_until = 0;
-                    snprintf(g_bubble, sizeof(g_bubble), "已关闭点击穿透");
+                    bub_local("已关闭点击穿透", BUB_INFO, 2000);
                 }
                 break;
 
@@ -1986,22 +2173,22 @@ int main(int argc, char **argv)
                         case 0:
                             g_topmost = !g_topmost;
                             plat_set_topmost(win, g_topmost);
-                            snprintf(g_bubble, sizeof(g_bubble), g_topmost ? "已置顶" : "已取消置顶");
+                            bub_local(g_topmost ? "已置顶" : "已取消置顶", BUB_INFO, 1800);
                             break;
                         case 1:
                             g_click_through_all = !g_click_through_all;
                             plog("menu item1 clickthru=%d", g_click_through_all);
                             plat_set_click_through_all(win, g_click_through_all);
                             g_click_through_until = g_click_through_all ? plat_ms() + 30000 : 0;
-                            snprintf(g_bubble, sizeof(g_bubble),
-                                     g_click_through_all ? "点击穿透已开（30s 后自动恢复）" : "已关闭点击穿透");
+                            bub_local(g_click_through_all ? "点击穿透已开（30s 后自动恢复）" : "已关闭点击穿透",
+                                      BUB_INFO, 2600);
                             break;
                         case 3:
                             if (atlas_load(g_sheet_path) == 0) {
                                 g_force_redraw = 1;
-                                snprintf(g_bubble, sizeof(g_bubble), "素材已重载");
+                                bub_local("素材已重载", BUB_OK, 2200);
                             } else
-                                snprintf(g_bubble, sizeof(g_bubble), "重载失败");
+                                bub_local("重载失败", BUB_ERR, 5000);
                             break;
                         case 4: {
                             int wx, wy, ww, wh;
@@ -2010,7 +2197,7 @@ int main(int argc, char **argv)
                             g_y = wy + wh - WIN_H - 8;
                             plat_move(win, g_x, g_y);
                             save_position(posfile);
-                            snprintf(g_bubble, sizeof(g_bubble), "已回到右下角");
+                            bub_local("已回到右下角", BUB_INFO, 1800);
                             break;
                         }
                         case 5:
@@ -2051,13 +2238,13 @@ int main(int argc, char **argv)
                         if (pt_in(lx2, ly2, px2, py2, PET_W, PET_H)) {
                             set_state(ST_DONE);
                             g_pet_reaction_until = plat_ms() + PET_REACT_MS;
-                            snprintf(g_bubble, sizeof(g_bubble), "被摸到了～");
+                            bub_local("被摸到了～", BUB_INFO, 1500);
                         }
                     }
                 } else if (!g_drag_moved) {
                     set_state(ST_DONE);
                     g_pet_reaction_until = plat_ms() + PET_REACT_MS;
-                    snprintf(g_bubble, sizeof(g_bubble), "被摸到了～");
+                    bub_local("被摸到了～", BUB_INFO, 1500);
                 }
                 g_drag = 0;
                 break;
@@ -2076,7 +2263,8 @@ int main(int argc, char **argv)
             g_click_through_all = 0;
             g_click_through_until = 0;
             plat_set_click_through_all(win, 0);
-            snprintf(g_bubble, sizeof(g_bubble), "点击穿透已自动恢复"); plog("auto-restore clickthru");
+            bub_local("点击穿透已自动恢复", BUB_INFO, 2600);
+            plog("auto-restore clickthru");
         }
 
         /* 菜单悬停高亮 + 子菜单展开（全用光标位置算，不依赖移动事件） */
@@ -2166,6 +2354,7 @@ int main(int argc, char **argv)
         }
 
         if (g_force_redraw) { g_force_redraw = 0; g_last_fs = g_last_us = 0; }
+        bub_tick(now);                       /* 每帧推进气泡的淡入淡出 */
         uint64_t fs = sig_frame_part(), us = sig_ui_part();
         int ui_changed = (us != g_last_us);
         if (fs != g_last_fs || ui_changed) {
@@ -2173,7 +2362,7 @@ int main(int argc, char **argv)
             g_last_fs = fs;
             g_last_us = us;
             if (ui_changed) {
-                render_static(g_bubble);
+                render_static();
                 if (g_ui) memcpy(g_ui, g_fb, (size_t)WIN_W * WIN_H * 4);
             }
             render_compose();

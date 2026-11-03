@@ -11,7 +11,10 @@
 //   state=busy|idle          宠物整体动画状态
 //   phase=start|tool|end|error|cancel
 //   active=2                 运行中的会话数
-//   bubble=...               当前会话的一句话
+//   bubble=...               气泡文字（有生命周期，过期就是空）
+//   bubble_kind=live|info|ok|err
+//   bubble_left=<ms>         还剩多久淡出（0 = 常驻，live 用）
+//   bubble_agent=...         气泡属于谁（画状态行用，空则不画）
 //   s=<id>|<agent>|<model>|<state>|<round>|<elapsed>|<tin>|<tout>|<credits>|<query>
 //   （按「失败 > 运行中 > 刚完成」排序，最多 8 条）
 
@@ -20,8 +23,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DONE_HOLD_MS = 4000;      // 完成后整体动画停留
-const ROW_HOLD_MS = 10000;      // 完成/失败后“宠物姿态”还跟多久（列表里不再自动消失）
+// 气泡不是状态，是通知：每种消息有自己的停留时间，到点由桌宠淡出。
+// live 不过期（进行中一直显示），ok/err 留够看清的时间。
+const BUBBLE_TTL = { live: 0, info: 2600, ok: 3500, err: 9000 };
+const BUBBLE_DEFAULT_TTL = 3500;
 const MAX_KEEP = 12;           // 会话表最多留几条（超了删最旧的已结束）
 const IDLE_WATCHDOG_MS = 180000;
 const MAX_ROWS = 8;
@@ -52,6 +57,12 @@ export function createPetCore(options = {}) {
   const clients = new Set();
   let lastEvent = null;
   let seq = 0;
+
+  /* 当前气泡：{ text, kind, key, at, ttl, agent, state }
+   * key 是会话 id —— 同一会话的新消息直接覆盖自己；
+   * 错误提示在 TTL 内不会被别的消息挤掉，免得失败原因一闪而过。 */
+  let bubble = null;
+  let bubbleWasAlive = false;
   // 初始快照：会话表是空的，就是等待态（以前写死 idle，Codex 多轨图集上看不到等待动作）
   let lastSnapshot = { state: "waiting", anim: "waiting", active: 0, bubble: null, phase: "", rows: [] };
 
@@ -108,10 +119,39 @@ export function createPetCore(options = {}) {
     return { state: "waiting", phase: "" };
   }
 
+  function bubbleAlive(now = Date.now()) {
+    if (!bubble) return false;
+    return !bubble.ttl || now < bubble.at + bubble.ttl;
+  }
+
+  // 只改状态，不广播；调用方统一 emitState（一条事件只推一次）
+  function say(text, kind = "info", key = "", meta = {}) {
+    const t = String(text ?? "").replace(/\s+/g, " ").trim();
+    if (!t) return;
+    const now = Date.now();
+    if (bubble && bubble.key !== key && bubble.kind === "err" && bubbleAlive(now) && kind !== "err")
+      return;
+    bubble = {
+      text: t,
+      kind,
+      key,
+      at: now,
+      ttl: BUBBLE_TTL[kind] ?? BUBBLE_DEFAULT_TTL,
+      agent: meta.agent ?? "",
+      state: meta.state ?? "",
+    };
+  }
+
+  // 会话被关掉时，属于它的气泡一起收掉
+  function hush(key) {
+    if (bubble && (!key || bubble.key === key)) bubble = null;
+  }
+
   function snapshot() {
     const rows = sortedRows();
     const o = overall();
     const running = [...sessions.values()].filter(isRunning).length;
+    const b = bubbleAlive() ? bubble : null;
     return {
       type: "state",
       state: running === 0 ? "idle" : "busy",
@@ -120,6 +160,11 @@ export function createPetCore(options = {}) {
       active: running,
       current: rows[0] ?? null,
       rows,
+      bubble: b ? b.text : null,
+      bubbleKind: b ? b.kind : "",
+      bubbleLeft: b && b.ttl ? Math.max(0, b.at + b.ttl - Date.now()) : 0,
+      bubbleAgent: b ? b.agent : "",
+      bubbleState: b ? b.state : "",
       at: Date.now(),
     };
   }
@@ -144,6 +189,8 @@ export function createPetCore(options = {}) {
   function petText() {
     const s = lastSnapshot;
     const cur = s.current ?? {};
+    // 用实时气泡算，而不是 lastSnapshot：没人 emitState 时也不会一直挂着旧消息
+    const b = bubbleAlive() ? bubble : null;
     const lines = [
       `seq=${s.seq ?? 0}`,
       `state=${s.anim ?? "idle"}`,
@@ -152,7 +199,11 @@ export function createPetCore(options = {}) {
       `agent=${clean(cur.agent, 24)}`,
       `model=${clean(cur.model, 40)}`,
       `round=${cur.round ?? 0}`,
-      `bubble=${clean(s.bubble ?? "", 120)}`,
+      `bubble=${clean(b?.text ?? "", 120)}`,
+      `bubble_kind=${b?.kind ?? ""}`,
+      `bubble_left=${b && b.ttl ? Math.max(0, b.at + b.ttl - Date.now()) : 0}`,
+      `bubble_agent=${clean(b?.agent ?? "", 24)}`,
+      `bubble_state=${clean(b?.state ?? "", 16)}`,
     ];
     for (const r of s.rows ?? []) {
       const el = isRunning(r) ? Date.now() - r.startedAt : r.elapsed || 0;
@@ -164,22 +215,26 @@ export function createPetCore(options = {}) {
     return lines.join("\n") + "\n";
   }
 
+  // 气泡文案 + 类型。状态/agent 放到 bubble_agent/bubble_state 里走结构化字段，
+  // 内容行只放「发生了什么」，避免两行信息重复。
+  // 进行中的文案不带秒数：每 250ms 变一次宽度会让气泡一直抖。
   function bubbleFor(s) {
-    const who = s.agent ? `${s.agent} ` : "";
-    if (s.state === "failed") return `${who}失败 · ${s.err || ""}`.trim();
+    if (s.state === "failed") return { text: s.err || "未知错误", kind: "err" };
     if (s.state === "done") {
       const p = [];
       if (s.elapsed) p.push(s.elapsed < 1000 ? `${s.elapsed}ms` : `${(s.elapsed / 1000).toFixed(1)}s`);
       const tok = s.tin + s.tout;
       if (tok) p.push(`${tok} tok`);
-      return p.length ? `完成 · ${p.join(" · ")}` : "搞定！";
+      return { text: p.length ? `用时 ${p.join(" · ")}` : "搞定！", kind: "ok" };
     }
-    if (s.state === "tool") {
-      const el = Date.now() - s.startedAt;
-      return `用工具中… ${el < 1000 ? `${el}ms` : `${(el / 1000).toFixed(1)}s`}`;
-    }
-    if (s.query) return `${who}收到：「${clip(s.query, 28)}」`;
-    return `${who}开工了`;
+    if (s.state === "tool") return { text: s.query ? clip(s.query, 28) : "正在处理…", kind: "live" };
+    if (s.query) return { text: `收到：「${clip(s.query, 28)}」`, kind: "live" };
+    return { text: "思考中…", kind: "live" };
+  }
+
+  function sayFor(s) {
+    const b = bubbleFor(s);
+    say(b.text, b.kind, s.id, { agent: s.agent, state: s.state });
   }
 
   // ---------------- 事件入口 ----------------
@@ -198,7 +253,8 @@ export function createPetCore(options = {}) {
     s.startedAt = Date.now();
     s.lastAt = s.startedAt;
     s.finishedAt = 0;
-    emitState({ bubble: bubbleFor(s) });
+    sayFor(s);
+    emitState();
   }
 
   function onEnd(ev) {
@@ -226,7 +282,8 @@ export function createPetCore(options = {}) {
       s.elapsed = elapsed;
       if (inp) s.tin += inp;
       if (out) s.tout += out;
-      emitState({ bubble: bubbleFor(s) });
+      sayFor(s);
+      emitState();
       return;
     }
 
@@ -235,8 +292,9 @@ export function createPetCore(options = {}) {
     s.finishedAt = Date.now();
     if (inp) s.tin += inp;
     if (out) s.tout += out;
-    emitState({ bubble: bubbleFor(s) });
-    setTimeout(() => emitState({ bubble: null }), DONE_HOLD_MS);
+    sayFor(s);
+    emitState();
+    // 气泡的寿命写在消息里（bubble_left），桌宠自己淡出；这里不再 setTimeout
   }
 
   function onError(ev) {
@@ -252,13 +310,16 @@ export function createPetCore(options = {}) {
     s.state = "failed";
     s.err = `${describeError(Number(ev.code) || 0, ev.err)}${ev.code ? " " + ev.code : ""}`;
     s.finishedAt = Date.now();
-    emitState({ bubble: bubbleFor(s) });
+    sayFor(s);
+    emitState();
   }
 
   function onCancel(ev) {
     const id = sidOf(ev);
     sessions.delete(id);
-    emitState({ bubble: "已取消" });
+    hush(id);
+    say("已取消", "info", id, { agent: ev.agent || "", state: "" });
+    emitState();
   }
 
   // ---------------- 错误/取消：旁听 magpie 的 usage.jsonl ----------------
@@ -316,7 +377,7 @@ export function createPetCore(options = {}) {
       const sid = row.session || row.native_session || "";
 
       if (status === 499 || String(row.err || "").toLowerCase().includes("canceled")) {
-        if (sid && sessions.has(sid)) { sessions.delete(sid); changed = true; }
+        if (sid && sessions.has(sid)) { sessions.delete(sid); hush(sid); changed = true; }
         continue;
       }
       if (status >= 400) {
@@ -325,6 +386,7 @@ export function createPetCore(options = {}) {
           s.state = "failed";
           s.err = describeError(status, row.err);
           s.finishedAt = Date.now();
+          sayFor(s);            // 旁听到的失败也弹一次气泡，别只靠钩子
           changed = true;
         }
         continue;
@@ -350,14 +412,15 @@ export function createPetCore(options = {}) {
     if (usageTimer.unref) usageTimer.unref();
   }
 
-  // 清理：已结束的行不再自动消失（用户手动点 × 关掉），
-  // 只处理两件事：卡死的运行中会话、总量超限时删最旧的已结束行
+  // 清理：已结束的行不自动消失（用户手动点 × 关掉），
+  // 只处理三件事：卡死的运行中会话、总量超限时删最旧的已结束行、气泡到点
   const sweeper = setInterval(() => {
     const now = Date.now();
     let changed = false;
     for (const [id, s] of sessions) {
       if (isRunning(s) && now - s.startedAt > IDLE_WATCHDOG_MS) {
         sessions.delete(id);
+        hush(id);
         changed = true;
       }
     }
@@ -369,10 +432,15 @@ export function createPetCore(options = {}) {
       for (const [id] of finished) {
         if (over-- <= 0) break;
         sessions.delete(id);
+        hush(id);
         changed = true;
       }
     }
-    if (changed) emitState({ bubble: null });
+    // 气泡过期时推一次状态，SSE 客户端才能把最后那条抹掉
+    const alive = bubbleAlive(now);
+    if (bubbleWasAlive && !alive) { bubble = null; changed = true; }
+    bubbleWasAlive = alive;
+    if (changed) emitState();
   }, 1000);
   if (sweeper.unref) sweeper.unref();
 
@@ -421,7 +489,8 @@ export function createPetCore(options = {}) {
       /* 桌宠点 × 时调这里，把会话从表里拿掉（只影响显示，不影响真实请求） */
       const id = url.searchParams.get("id") || "";
       const had = sessions.delete(id);
-      if (had) emitState({ bubble: null });
+      hush(id);
+      if (had) emitState();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, removed: had }));
       return;
