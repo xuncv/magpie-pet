@@ -32,6 +32,7 @@ static int PET_W = 181, PET_H = 196;
 #define BUB_FADE_IN_MS   140  /* 气泡淡入 */
 #define BUB_FADE_OUT_MS  280  /* 气泡淡出（最后这段时间里向上飘） */
 #define POLL_MS 250
+#define TOPMOST_KEEP_MS 1000   /* 每秒把窗口按回置顶带：改 exstyle 会让它掉出去 */
 
 /* ---------------- 轨道（运行时） ----------------
  * 两种来源：
@@ -2038,6 +2039,7 @@ int main(int argc, char **argv)
     g_last_event_at = plat_ms();
     uint64_t next_poll = 0;
     uint64_t next_parent_check = 0;
+    uint64_t next_topmost_check = 0;
     int fail_streak = 0;
     char body[4096];
 
@@ -2051,6 +2053,14 @@ int main(int argc, char **argv)
                 plog("parent %d gone, exiting", parent_pid);
                 break;
             }
+        }
+
+        /* 置顶保持：SetWindowLongPtr 改 GWL_EXSTYLE（点击穿透开关）会让窗口
+         * 掉出 topmost 带 —— 样式位还在，但会被普通窗口盖住，看起来就是“消失了”。
+         * 别的置顶工具也会爬到上面，所以定期按回置顶带。 */
+        if (g_topmost && now >= next_topmost_check) {
+            next_topmost_check = now + TOPMOST_KEEP_MS;
+            plat_set_topmost(win, 1);
         }
 
         /* 轮询 */
@@ -2117,6 +2127,7 @@ int main(int argc, char **argv)
             case PKE_TOGGLE_CLICKTHRU:
                 g_click_through_all = !g_click_through_all;
                 plat_set_click_through_all(win, g_click_through_all);
+                plat_set_topmost(win, g_topmost);   /* 改 exstyle 会掉出置顶带 */
                 if (g_click_through_all) {
                     g_click_through_until = plat_ms() + 30000;   /* 30s 自动恢复，避免彻底失控 */
                     const char *hk = plat_hotkey_name(win);
@@ -2179,6 +2190,7 @@ int main(int argc, char **argv)
                             g_click_through_all = !g_click_through_all;
                             plog("menu item1 clickthru=%d", g_click_through_all);
                             plat_set_click_through_all(win, g_click_through_all);
+                            plat_set_topmost(win, g_topmost);
                             g_click_through_until = g_click_through_all ? plat_ms() + 30000 : 0;
                             bub_local(g_click_through_all ? "点击穿透已开（30s 后自动恢复）" : "已关闭点击穿透",
                                       BUB_INFO, 2600);
@@ -2263,6 +2275,7 @@ int main(int argc, char **argv)
             g_click_through_all = 0;
             g_click_through_until = 0;
             plat_set_click_through_all(win, 0);
+            plat_set_topmost(win, g_topmost);
             bub_local("点击穿透已自动恢复", BUB_INFO, 2600);
             plog("auto-restore clickthru");
         }
