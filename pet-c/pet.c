@@ -2342,6 +2342,11 @@ int main(int argc, char **argv)
                 /* 菜单开着：冻结列表展开。否则窗口一变宽，菜单跟着移位，点击全打偏 */
                 g_hover_since = 0;
                 g_leave_since = 0;
+            } else if (g_drag) {
+                /* 拖动中冻结列表：relayout 会在拖动途中改窗口宽度/位置，
+                 * 跟 WM_MOUSEMOVE 里的 SetWindowPos 打架，表现就是“拖不动” */
+                g_hover_since = 0;
+                g_leave_since = 0;
             } else if (hov) {
                 g_leave_since = 0;
                 if (!g_hover_since) g_hover_since = now;
